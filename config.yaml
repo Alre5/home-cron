@@ -33,7 +33,7 @@ tier_fill_tolerance: 0.05
 # question (e.g. "April 21, 2026") and the day is interpreted as ET.
 # Rationale: a last-minute dip to 60/50 means Trump probably won't have
 # time to insult anyone today, so the expected value turns negative.
-skip_if_minutes_remaining_below: 60
+skip_if_minutes_remaining_below: 120
 
 # --- Backtest config ---
 
