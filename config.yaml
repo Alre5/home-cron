@@ -12,10 +12,13 @@ event_slug: will-trump-publicly-insult-someone-on
 #   price later drops to 0.48 -> bot tops up another $7.50 (tier 2)
 #   total committed in that market: $12.50 (25% of the balance at that time)
 entry_ladder:
-  - price: 0.60
-    pct_of_balance: 0.10    # tier 1: entry at first dip
-  - price: 0.50
-    pct_of_balance: 0.15    # tier 2: aggressive add on deeper dip
+  - price: 0.80
+    pct_of_balance: 0.10    # tier 1: entry at modest dip (matches scale_80_70 backtest)
+  - price: 0.70
+    pct_of_balance: 0.20    # tier 2: aggressive add at deeper dip
+  # If the market opens or drops directly to <= 0.70, the bot fires the
+  # full cumulative target (30% of balance) in a single order at the
+  # current low price — no need to wait for an intermediate fill.
 
 # Polymarket enforces ~$1 minimum order value. Skip any top-up below this.
 min_order_usdc: 1.0
@@ -62,11 +65,35 @@ backtest:
           usdc: 5
         - price: 0.50
           usdc: 10
-    - name: "scale_65_55_45"
+    - name: "flat_80"
       tiers:
-        - price: 0.65
+        - price: 0.80
+          usdc: 15
+    - name: "flat_70"
+      tiers:
+        - price: 0.70
+          usdc: 15
+    - name: "scale_80_70"
+      tiers:
+        - price: 0.80
+          usdc: 5
+        - price: 0.70
+          usdc: 10
+    - name: "scale_80_70_60"
+      tiers:
+        - price: 0.80
           usdc: 3
-        - price: 0.55
-          usdc: 6
-        - price: 0.45
-          usdc: 12
+        - price: 0.70
+          usdc: 5
+        - price: 0.60
+          usdc: 7
+    - name: "scale_80_70_60_50"
+      tiers:
+        - price: 0.80
+          usdc: 2
+        - price: 0.70
+          usdc: 4
+        - price: 0.60
+          usdc: 4
+        - price: 0.50
+          usdc: 5
