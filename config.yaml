@@ -1,0 +1,72 @@
+# --- Live bot config ---
+
+event_slug: will-trump-publicly-insult-someone-on
+
+# Scale-in ladder. Each tier triggers when the YES ask is at or below `price`.
+# `pct_of_balance` is the fraction of the *current* USDC balance to deploy at
+# that tier, per market. Tiers are cumulative: if the price dips straight
+# through tier 1 into tier 2, the bot deploys tier_1 + tier_2 at once.
+#
+# Example with $50 balance:
+#   price drops to 0.58 -> bot buys $5 (tier 1)
+#   price later drops to 0.48 -> bot tops up another $7.50 (tier 2)
+#   total committed in that market: $12.50 (25% of the balance at that time)
+entry_ladder:
+  - price: 0.60
+    pct_of_balance: 0.10    # tier 1: entry at first dip
+  - price: 0.50
+    pct_of_balance: 0.15    # tier 2: aggressive add on deeper dip
+
+# Polymarket enforces ~$1 minimum order value. Skip any top-up below this.
+min_order_usdc: 1.0
+
+# Round order size down to this many decimals (USDC has 6; UI shows 2).
+order_decimals: 2
+
+# Tolerance when deciding a tier is already filled. If current spent on a
+# market is within this fraction of the tier's cumulative target, the bot
+# treats the tier as done and won't top up.
+tier_fill_tolerance: 0.05
+
+# Safety cutoff: don't buy a market if fewer than this many minutes remain
+# before its resolution-day ends. The market's "day" is parsed from its
+# question (e.g. "April 21, 2026") and the day is interpreted as ET.
+# Rationale: a last-minute dip to 60/50 means Trump probably won't have
+# time to insult anyone today, so the expected value turns negative.
+skip_if_minutes_remaining_below: 60
+
+# --- Backtest config ---
+
+backtest:
+  # Flat thresholds to simulate. Reports PnL for each separately.
+  thresholds: [0.50, 0.60, 0.65, 0.70, 0.75, 0.80]
+  # How far back to search for historical daily markets.
+  lookback_days: 360
+  # Flat USDC amount per qualifying market in the flat-threshold sim.
+  position_size_usdc: 10.0
+  # Price history granularity in minutes.
+  fidelity_minutes: 60
+
+  # Scale-in / tiered entry strategies. Each strategy has a list of tiers.
+  # A tier triggers once per market when the YES price first drops at/below
+  # its `price`. Tiers are evaluated in order so earlier (higher-priced)
+  # tiers fire first.
+  tiered_strategies:
+    - name: "base_60"
+      tiers:
+        - price: 0.60
+          usdc: 15
+    - name: "scale_60_50"
+      tiers:
+        - price: 0.60
+          usdc: 5
+        - price: 0.50
+          usdc: 10
+    - name: "scale_65_55_45"
+      tiers:
+        - price: 0.65
+          usdc: 3
+        - price: 0.55
+          usdc: 6
+        - price: 0.45
+          usdc: 12
