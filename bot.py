@@ -2,9 +2,16 @@
 Polymarket "Will Trump publicly insult someone" bot.
 
 Single-execution entrypoint. Intended to be invoked on a schedule
-(GitHub Actions cron every ~5 min). Fetches the event's daily markets,
-and buys YES using a scale-in ladder: each tier triggers at a progressively
-lower price and deploys a configured % of balance.
+(GitHub Actions cron every ~5 min). Fetches the event's daily markets
+and posts a scale-in ladder of GTC limit BUY orders on the YES side
+of each daily sub-market, subject to time-cutoff and exposure caps.
+
+Two execution modes (config: order_mode):
+  - "limit"  (default): place GTC limit orders at each tier price.
+                        Anti-cross guard prevents accidental taker fills.
+                        Per-tier independent (NOT cumulative top-up).
+  - "market" (legacy):  market FOK at the current ask up to cumulative
+                        tier target. Kept for fallback / A/B testing.
 """
 
 from __future__ import annotations
@@ -15,7 +22,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 
@@ -25,11 +32,14 @@ from dotenv import load_dotenv
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
+    ApiCreds,
     AssetType,
     BalanceAllowanceParams,
     MarketOrderArgs,
+    OrderArgs,
     OrderType,
 )
+from py_clob_client.order_builder.constants import BUY
 
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -56,12 +66,17 @@ class LadderTier:
 
 @dataclass
 class Config:
-    event_slug: str
+    event_slug_keywords: list[str]
+    event_slug_fallback: str
+    order_mode: str  # "limit" | "market"
+    order_time_in_force: str  # "GTC" | "GTD"
     entry_ladder: list[LadderTier]
     min_order_usdc: float
     order_decimals: int
     tier_fill_tolerance: float
     skip_if_minutes_remaining_below: float
+    max_total_exposure_pct: float
+    max_active_markets: int
 
 
 def load_config(path: str = "config.yaml") -> Config:
@@ -73,13 +88,23 @@ def load_config(path: str = "config.yaml") -> Config:
         [LadderTier(price=float(t["price"]), pct_of_balance=float(t["pct_of_balance"])) for t in ladder_raw],
         key=lambda t: -t.price,
     )
+    keywords = raw.get("event_slug_keywords")
+    if keywords is None:
+        # Back-compat: if old config has event_slug, derive keywords from it.
+        slug = raw.get("event_slug", "")
+        keywords = [w for w in slug.split("-") if w and len(w) > 2][:3]
     return Config(
-        event_slug=raw["event_slug"],
+        event_slug_keywords=[k.lower() for k in keywords],
+        event_slug_fallback=raw.get("event_slug_fallback") or raw.get("event_slug", ""),
+        order_mode=str(raw.get("order_mode", "limit")).lower(),
+        order_time_in_force=str(raw.get("order_time_in_force", "GTC")).upper(),
         entry_ladder=ladder,
         min_order_usdc=float(raw["min_order_usdc"]),
         order_decimals=int(raw["order_decimals"]),
         tier_fill_tolerance=float(raw["tier_fill_tolerance"]),
         skip_if_minutes_remaining_below=float(raw.get("skip_if_minutes_remaining_below", 0)),
+        max_total_exposure_pct=float(raw.get("max_total_exposure_pct", 1.0)),
+        max_active_markets=int(raw.get("max_active_markets", 100)),
     )
 
 
@@ -134,27 +159,88 @@ def build_client() -> ClobClient:
     api_secret = os.environ.get("POLYMARKET_API_SECRET")
     api_pass = os.environ.get("POLYMARKET_API_PASSPHRASE")
     if api_key and api_secret and api_pass:
-        from py_clob_client.clob_types import ApiCreds
         client.set_api_creds(ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_pass))
     else:
         client.set_api_creds(client.create_or_derive_api_creds())
     return client
 
 
-def fetch_event(slug: str) -> dict:
-    r = requests.get(f"{GAMMA_API}/events", params={"slug": slug}, timeout=15)
-    r.raise_for_status()
-    events = r.json()
-    if not events:
-        raise RuntimeError(f"No event found for slug {slug!r}")
-    return events[0]
+# --- Event discovery ---
 
+def discover_event(keywords: list[str], fallback_slug: str) -> dict:
+    """Find an OPEN event whose slug contains every keyword. Falls back to
+    the explicit slug if the search returns nothing.
+    Auto-discovery prevents the recurring failure where Polymarket rotates
+    the slug suffix when re-creating a daily event each month.
+    """
+    keys = [k.lower() for k in keywords]
+    matches: list[dict] = []
+    offset = 0
+    page_size = 200
+    pages = 0
+    while True:
+        try:
+            r = requests.get(
+                f"{GAMMA_API}/events",
+                params={
+                    "closed": "false",
+                    "order": "startDate",
+                    "ascending": "false",
+                    "limit": page_size,
+                    "offset": offset,
+                },
+                timeout=20,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            log.warning("event search page %d failed: %s", pages, e)
+            break
+        data = r.json() or []
+        if not data:
+            break
+        for e in data:
+            slug = (e.get("slug") or "").lower()
+            if all(k in slug for k in keys):
+                matches.append(e)
+        offset += page_size
+        pages += 1
+        if pages > 25:
+            break
+
+    # Among matches, prefer the one with the most OPEN sub-markets (the live
+    # daily-insult event has 30+; stale ones have 0).
+    def score(ev: dict) -> int:
+        ms = ev.get("markets", []) or []
+        return sum(1 for m in ms if not m.get("closed") and not m.get("archived"))
+    matches.sort(key=score, reverse=True)
+    if matches and score(matches[0]) > 0:
+        chosen = matches[0]
+        log.info(
+            "Discovered event slug=%r (%d open sub-markets) via keywords %s",
+            chosen.get("slug"), score(chosen), keys,
+        )
+        return chosen
+
+    if fallback_slug:
+        log.warning("Auto-discovery returned no open event matching %s; falling back to slug=%r", keys, fallback_slug)
+        r = requests.get(f"{GAMMA_API}/events", params={"slug": fallback_slug}, timeout=15)
+        r.raise_for_status()
+        events = r.json()
+        if events:
+            return events[0]
+    raise RuntimeError(f"Could not find an open event for keywords={keys} (fallback={fallback_slug!r})")
+
+
+# --- Helpers ---
 
 def parse_json_field(raw) -> list:
     if isinstance(raw, list):
         return raw
     if isinstance(raw, str):
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except Exception:
+            return []
     return []
 
 
@@ -186,8 +272,34 @@ def best_ask(client: ClobClient, token_id: str) -> float | None:
     asks = getattr(book, "asks", None) or []
     if not asks:
         return None
-    prices = [float(a.price) for a in asks]
-    return min(prices)
+    return min(float(a.price) for a in asks)
+
+
+# Cache market constraints (tick size, min order size) per condition_id —
+# these are static for a market's lifetime; fetching every loop is wasteful.
+_MARKET_CONSTRAINTS_CACHE: dict[str, dict] = {}
+
+
+def get_market_constraints(condition_id: str) -> dict:
+    """Return {minimum_order_size, minimum_tick_size, neg_risk} for a market.
+    Public CLOB endpoint; no auth needed. Cached process-locally.
+    """
+    if condition_id in _MARKET_CONSTRAINTS_CACHE:
+        return _MARKET_CONSTRAINTS_CACHE[condition_id]
+    try:
+        r = requests.get(f"{CLOB_API}/markets/{condition_id}", timeout=15)
+        r.raise_for_status()
+        data = r.json() or {}
+    except Exception as e:
+        log.warning("market constraints fetch failed for %s: %s", condition_id[:12], e)
+        data = {}
+    out = {
+        "minimum_order_size": float(data.get("minimum_order_size") or 5),
+        "minimum_tick_size": float(data.get("minimum_tick_size") or 0.01),
+        "neg_risk": bool(data.get("neg_risk") or False),
+    }
+    _MARKET_CONSTRAINTS_CACHE[condition_id] = out
+    return out
 
 
 def get_balance_usdc(client: ClobClient) -> float:
@@ -200,11 +312,7 @@ def get_balance_usdc(client: ClobClient) -> float:
 def get_yes_position(proxy_address: str, condition_id: str) -> tuple[float, float]:
     """Return (size_shares, avg_fill_price) for the YES outcome of this market."""
     try:
-        r = requests.get(
-            f"{DATA_API}/positions",
-            params={"user": proxy_address},
-            timeout=15,
-        )
+        r = requests.get(f"{DATA_API}/positions", params={"user": proxy_address}, timeout=15)
         r.raise_for_status()
         positions = r.json()
     except Exception as e:
@@ -221,8 +329,320 @@ def get_yes_position(proxy_address: str, condition_id: str) -> tuple[float, floa
     return 0.0, 0.0
 
 
+# --- Order management (limit mode) ---
+
+@dataclass
+class OpenOrderRow:
+    order_id: str
+    token_id: str
+    price: float
+    size_shares: float       # original size
+    size_remaining: float    # unfilled
+    side: str                # "BUY" | "SELL"
+
+    @property
+    def remaining_usdc(self) -> float:
+        return self.price * self.size_remaining
+
+
+def list_open_orders(client: ClobClient) -> list[OpenOrderRow]:
+    """Return all open orders for the authenticated user."""
+    try:
+        raw = client.get_orders()
+    except Exception as e:
+        log.warning("get_orders failed: %s", e)
+        return []
+    out = []
+    for o in raw or []:
+        try:
+            side = (o.get("side") or "").upper()
+            price = float(o.get("price"))
+            size = float(o.get("original_size") or o.get("originalSize") or 0)
+            filled = float(o.get("size_matched") or o.get("sizeMatched") or 0)
+            remaining = max(size - filled, 0.0)
+            tid = o.get("asset_id") or o.get("market") or ""
+            oid = o.get("id") or o.get("orderID") or ""
+            out.append(OpenOrderRow(
+                order_id=str(oid),
+                token_id=str(tid),
+                price=price,
+                size_shares=size,
+                size_remaining=remaining,
+                side=side,
+            ))
+        except Exception as e:
+            log.warning("could not parse open order %s: %s", o, e)
+    return out
+
+
+def cancel_order_safe(client: ClobClient, order_id: str) -> bool:
+    try:
+        client.cancel(order_id=order_id)
+        return True
+    except Exception as e:
+        log.warning("cancel %s failed: %s", order_id[:12], e)
+        return False
+
+
+def post_gtc_limit_buy(
+    client: ClobClient,
+    token_id: str,
+    price: float,
+    size_shares: float,
+    tick_size: float = 0.01,
+    neg_risk: bool = False,
+) -> dict | None:
+    """Place a GTC limit BUY. Uses post_order(post_only=True) so the
+    exchange rejects the order if it would cross the spread — belt-and-
+    braces with our anti-cross check that runs before this call.
+    """
+    try:
+        # Round price to the exchange tick size to avoid validation errors.
+        ticks = round(price / tick_size)
+        rounded_price = round(ticks * tick_size, 6)
+        from py_clob_client.clob_types import PartialCreateOrderOptions
+        opts = PartialCreateOrderOptions(
+            tick_size=str(tick_size).rstrip("0").rstrip(".") if tick_size != 0.01 else "0.01",
+            neg_risk=neg_risk,
+        )
+        args = OrderArgs(
+            token_id=token_id,
+            price=rounded_price,
+            size=size_shares,
+            side=BUY,
+        )
+        signed = client.create_order(args, opts)
+        resp = client.post_order(signed, OrderType.GTC, post_only=True)
+        return resp
+    except Exception as e:
+        log.error("post limit BUY %.2f x %.4f on %s failed: %s", price, size_shares, token_id[:10], e)
+        return None
+
+
+# --- Strategy: limit-mode placement ---
+
+def open_buy_orders_for_token(orders: list[OpenOrderRow], token_id: str) -> list[OpenOrderRow]:
+    return [o for o in orders if o.token_id == token_id and o.side == "BUY"]
+
+
+def find_matching_order(open_orders_for_token: list[OpenOrderRow], price: float, tol: float = 1e-3) -> OpenOrderRow | None:
+    for o in open_orders_for_token:
+        if abs(o.price - price) <= tol:
+            return o
+    return None
+
+
+def market_committed_usdc(open_orders_for_token: list[OpenOrderRow], filled_size: float, filled_avg: float) -> float:
+    """Total USDC committed to this market: open BUY orders + filled YES position."""
+    open_usdc = sum(o.remaining_usdc for o in open_orders_for_token)
+    filled_usdc = filled_size * filled_avg
+    return open_usdc + filled_usdc
+
+
+def run_once_limit(cfg: Config, client: ClobClient, funder: str) -> None:
+    balance = get_balance_usdc(client)
+    log.info("USDC balance: %.4f", balance)
+    if balance < cfg.min_order_usdc:
+        log.info("Balance below min_order_usdc, nothing to do.")
+        return
+
+    log.info(
+        "Limit-mode ladder per market: %s  (cum %.0f%% if all tiers fill)",
+        ", ".join(f"<= {t.price:.2f} -> {t.pct_of_balance*100:.1f}%" for t in cfg.entry_ladder),
+        sum(t.pct_of_balance for t in cfg.entry_ladder) * 100,
+    )
+
+    event = discover_event(cfg.event_slug_keywords, cfg.event_slug_fallback)
+    raw_markets = event.get("markets", []) or []
+    log.info("Event '%s' has %d sub-markets", event.get("title", event.get("slug")), len(raw_markets))
+
+    # Snapshot all open orders ONCE; we'll filter per market.
+    open_orders = list_open_orders(client)
+    log.info("Found %d open orders globally", len(open_orders))
+
+    # Build prioritized list of tradeable markets: filter by tradeable +
+    # time-cutoff, sort by ascending mins-to-EOD, cap at max_active_markets.
+    candidates = []
+    for m in raw_markets:
+        if not market_is_tradeable(m):
+            continue
+        q = m.get("question") or m.get("slug") or ""
+        tid = yes_token_id(m)
+        if not tid:
+            continue
+        mins_left = minutes_until_resolution_day_end(q)
+        if mins_left is None:
+            log.warning("[%s] could not parse resolution date, skipping", q)
+            continue
+        if mins_left < cfg.skip_if_minutes_remaining_below:
+            continue
+        candidates.append({
+            "question": q,
+            "token_id": tid,
+            "condition_id": m.get("conditionId", ""),
+            "mins_left": mins_left,
+        })
+    candidates.sort(key=lambda c: c["mins_left"])
+    log.info(
+        "Candidates after time-cutoff filter (>= %.0f min): %d",
+        cfg.skip_if_minutes_remaining_below, len(candidates),
+    )
+
+    # Compute current global exposure across ALL markets (not just candidates,
+    # so old open orders count too).
+    global_committed = 0.0
+    per_token_committed: dict[str, float] = {}
+    for o in open_orders:
+        if o.side != "BUY":
+            continue
+        per_token_committed[o.token_id] = per_token_committed.get(o.token_id, 0.0) + o.remaining_usdc
+        global_committed += o.remaining_usdc
+    # Add filled positions for candidate markets
+    for c in candidates:
+        size, avg = get_yes_position(funder, c["condition_id"])
+        c["filled_size"] = size
+        c["filled_avg"] = avg
+        filled_usdc = size * avg
+        per_token_committed[c["token_id"]] = per_token_committed.get(c["token_id"], 0.0) + filled_usdc
+        global_committed += filled_usdc
+
+    cap_total = cfg.max_total_exposure_pct * balance
+    log.info(
+        "Current exposure: $%.2f / cap $%.2f (%.0f%% of balance)",
+        global_committed, cap_total, cfg.max_total_exposure_pct * 100,
+    )
+
+    # Restrict to top-N markets by ascending mins_left, ignoring those that
+    # already have committed exposure (so we don't double-count the cap by
+    # also opening new in less prioritised slots).
+    active = candidates[: cfg.max_active_markets]
+    log.info("Will work on top %d candidates by time-to-EOD", len(active))
+
+    placed = 0
+    cancelled = 0
+    skipped_anti_cross = 0
+    skipped_already_open = 0
+    skipped_cap = 0
+    skipped_per_market_cap = 0
+
+    per_market_cap_usdc = sum(t.pct_of_balance for t in cfg.entry_ladder) * balance
+
+    # Pre-fetch best ask + token_orders + market constraints for each active
+    # market once (to avoid repeated CLOB calls in the round-robin loop).
+    for c in active:
+        c["token_orders"] = open_buy_orders_for_token(open_orders, c["token_id"])
+        c["ask"] = best_ask(client, c["token_id"])
+        c["market_committed"] = per_token_committed.get(c["token_id"], 0.0)
+        c["constraints"] = get_market_constraints(c["condition_id"])
+
+    # Round-robin across tiers: place tier 1 on ALL markets first, then tier 2, ...
+    # This biases toward diversification rather than filling one market completely
+    # before moving on, which matters when balance is small relative to the
+    # cumulative per-market exposure.
+    for tier in cfg.entry_ladder:
+        tier_usdc = tier.pct_of_balance * balance
+        if tier_usdc < cfg.min_order_usdc:
+            log.info(
+                "tier <=%.2f: tier_usdc $%.2f < min_order $%.2f, skip whole tier",
+                tier.price, tier_usdc, cfg.min_order_usdc,
+            )
+            continue
+
+        for c in active:
+            q = c["question"]
+            tid = c["token_id"]
+            ask = c["ask"]
+            token_orders = c["token_orders"]
+
+            if ask is None:
+                continue
+
+            # Per-market cap: don't pile on if this market is already saturated.
+            if c["market_committed"] >= per_market_cap_usdc * (1 - cfg.tier_fill_tolerance):
+                skipped_per_market_cap += 1
+                continue
+
+            # Anti-cross
+            if ask <= tier.price:
+                skipped_anti_cross += 1
+                log.info(
+                    "[%s] tier <=%.2f: ask %.4f <= tier -> anti-cross skip",
+                    q, tier.price, ask,
+                )
+                continue
+
+            desired_size_shares = round_down(tier_usdc / tier.price, cfg.order_decimals)
+            if desired_size_shares <= 0:
+                continue
+
+            min_shares = c["constraints"]["minimum_order_size"]
+            if desired_size_shares < min_shares:
+                log.info(
+                    "[%s] tier <=%.2f: size %.2f sh < market min %.0f sh ($%.2f), skip "
+                    "(increase balance, raise this tier's pct, or accept that small tiers won't post)",
+                    q, tier.price, desired_size_shares, min_shares, tier_usdc,
+                )
+                continue
+
+            existing = find_matching_order(token_orders, tier.price)
+            if existing is not None:
+                size_diff = abs(existing.size_remaining - desired_size_shares) / max(desired_size_shares, 1e-9)
+                if size_diff < 0.10:
+                    skipped_already_open += 1
+                    log.info(
+                        "[%s] tier <=%.2f: matching open order present (%.4f sh), keep",
+                        q, tier.price, existing.size_remaining,
+                    )
+                    continue
+                log.info(
+                    "[%s] tier <=%.2f: open order diverges (%.4f vs %.4f), cancel+replace",
+                    q, tier.price, existing.size_remaining, desired_size_shares,
+                )
+                if cancel_order_safe(client, existing.order_id):
+                    cancelled += 1
+                    global_committed -= existing.remaining_usdc
+                    c["market_committed"] -= existing.remaining_usdc
+
+            order_cost_usdc = desired_size_shares * tier.price
+            if global_committed + order_cost_usdc > cap_total + 1e-6:
+                skipped_cap += 1
+                log.info(
+                    "[%s] tier <=%.2f: would exceed global cap ($%.2f + $%.2f > $%.2f), skip",
+                    q, tier.price, global_committed, order_cost_usdc, cap_total,
+                )
+                continue
+
+            log.info(
+                "[%s] PLACE GTC BUY %.4f sh @ %.2f ($%.2f)",
+                q, desired_size_shares, tier.price, order_cost_usdc,
+            )
+            resp = post_gtc_limit_buy(
+                client, tid, tier.price, desired_size_shares,
+                tick_size=c["constraints"]["minimum_tick_size"],
+                neg_risk=c["constraints"]["neg_risk"],
+            )
+            if resp is not None:
+                placed += 1
+                global_committed += order_cost_usdc
+                c["market_committed"] += order_cost_usdc
+                token_orders.append(OpenOrderRow(
+                    order_id=str(resp.get("orderID") or resp.get("id") or ""),
+                    token_id=tid,
+                    price=tier.price,
+                    size_shares=desired_size_shares,
+                    size_remaining=desired_size_shares,
+                    side="BUY",
+                ))
+
+    log.info(
+        "Run complete. placed=%d cancelled=%d skipped_anti_cross=%d skipped_already_open=%d skipped_cap=%d skipped_per_market_cap=%d",
+        placed, cancelled, skipped_anti_cross, skipped_already_open, skipped_cap, skipped_per_market_cap,
+    )
+
+
+# --- Strategy: legacy market-FOK mode (kept for fallback) ---
+
 def cumulative_ladder_targets(balance: float, ladder: list[LadderTier]) -> list[float]:
-    """Cumulative USDC target after filling each tier (in order)."""
     out = []
     cum = 0.0
     for t in ladder:
@@ -231,26 +651,22 @@ def cumulative_ladder_targets(balance: float, ladder: list[LadderTier]) -> list[
     return out
 
 
-# --- Strategy ---
-
-def run_once(cfg: Config) -> None:
-    client = build_client()
-    funder = os.environ["POLYMARKET_FUNDER_ADDRESS"]
-
+def run_once_market(cfg: Config, client: ClobClient, funder: str) -> None:
     balance = get_balance_usdc(client)
     log.info("USDC balance: %.4f", balance)
     if balance < cfg.min_order_usdc:
         log.info("Balance below min_order_usdc, nothing to do.")
         return
 
-    ladder_desc = ", ".join(f"<= {t.price:.2f} -> {t.pct_of_balance*100:.1f}% of balance" for t in cfg.entry_ladder)
-    log.info("Entry ladder: %s", ladder_desc)
-
+    log.info(
+        "Market-FOK-mode ladder: %s  (cumulative)",
+        ", ".join(f"<= {t.price:.2f} -> {t.pct_of_balance*100:.1f}%" for t in cfg.entry_ladder),
+    )
     targets = cumulative_ladder_targets(balance, cfg.entry_ladder)
 
-    event = fetch_event(cfg.event_slug)
-    markets = event.get("markets", [])
-    log.info("Event '%s' has %d sub-markets", event.get("title", cfg.event_slug), len(markets))
+    event = discover_event(cfg.event_slug_keywords, cfg.event_slug_fallback)
+    markets = event.get("markets", []) or []
+    log.info("Event '%s' has %d sub-markets", event.get("title", event.get("slug")), len(markets))
 
     remaining_balance = balance
 
@@ -258,71 +674,45 @@ def run_once(cfg: Config) -> None:
         q = m.get("question") or m.get("slug") or m.get("id")
         if not market_is_tradeable(m):
             continue
-
         tid = yes_token_id(m)
         if not tid:
-            log.warning("[%s] no YES token id, skipping", q)
             continue
-
         ask = best_ask(client, tid)
         if ask is None:
-            log.info("[%s] no asks on book, skipping", q)
             continue
-
         shallowest_trigger = cfg.entry_ladder[0].price
         if ask > shallowest_trigger:
-            log.info("[%s] ask %.3f > %.3f (top of ladder), skip", q, ask, shallowest_trigger)
             continue
-
         if cfg.skip_if_minutes_remaining_below > 0:
             mins_left = minutes_until_resolution_day_end(q)
-            if mins_left is None:
-                log.warning("[%s] could not parse resolution date, not applying time cutoff", q)
-            elif mins_left < cfg.skip_if_minutes_remaining_below:
-                log.info(
-                    "[%s] only %.1f min left until end of day (< %.0f), skip",
-                    q, mins_left, cfg.skip_if_minutes_remaining_below,
-                )
+            if mins_left is None or mins_left < cfg.skip_if_minutes_remaining_below:
                 continue
 
         cid = m.get("conditionId", "")
         size, avg = get_yes_position(funder, cid)
         current_spent = size * avg
-
-        # Find the deepest tier whose price is still accessible.
         deepest_idx = None
         for idx, tier in enumerate(cfg.entry_ladder):
             if ask <= tier.price:
                 deepest_idx = idx
         if deepest_idx is None:
             continue
-
         target_spend = targets[deepest_idx]
         gap = target_spend - current_spent
         tol_abs = cfg.tier_fill_tolerance * target_spend
         if gap <= tol_abs:
-            log.info("[%s] tier %d already filled (spent %.2f / target %.2f)", q, deepest_idx + 1, current_spent, target_spend)
             continue
-
         order_amount = round_down(gap, cfg.order_decimals)
         if order_amount < cfg.min_order_usdc:
-            log.info("[%s] gap %.2f below min_order %.2f, skip", q, gap, cfg.min_order_usdc)
             continue
-
         if order_amount > remaining_balance:
             if remaining_balance < cfg.min_order_usdc:
-                log.info("[%s] remaining balance %.2f below min_order, stop", q, remaining_balance)
                 break
             order_amount = round_down(remaining_balance, cfg.order_decimals)
-            log.info("[%s] capping order to remaining balance %.2f", q, order_amount)
-
-        log.info(
-            "[%s] BUY tier %d -> %.2f USDC @ ask %.3f (current pos %.2f shares @ %.3f avg)",
-            q, deepest_idx + 1, order_amount, ask, size, avg,
-        )
+        log.info("[%s] BUY tier %d -> %.2f USDC @ ask %.3f", q, deepest_idx + 1, order_amount, ask)
         try:
-            order_args = MarketOrderArgs(token_id=tid, amount=order_amount)
-            signed = client.create_market_order(order_args)
+            args = MarketOrderArgs(token_id=tid, amount=order_amount)
+            signed = client.create_market_order(args)
             resp = client.post_order(signed, OrderType.FOK)
             log.info("[%s] order response: %s", q, resp)
             remaining_balance -= order_amount
@@ -334,7 +724,15 @@ def main() -> int:
     load_dotenv()
     cfg = load_config()
     try:
-        run_once(cfg)
+        client = build_client()
+        funder = os.environ["POLYMARKET_FUNDER_ADDRESS"]
+        if cfg.order_mode == "limit":
+            run_once_limit(cfg, client, funder)
+        elif cfg.order_mode == "market":
+            run_once_market(cfg, client, funder)
+        else:
+            log.error("Unknown order_mode: %r", cfg.order_mode)
+            return 1
     except KeyError as e:
         log.error("Missing env var: %s", e)
         return 1

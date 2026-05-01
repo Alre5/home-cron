@@ -8,4 +8,5 @@ venv/
 .mypy_cache/
 *.log
 backtest_results/
+backtest_cache.json
 .claude/
