@@ -81,17 +81,14 @@ def main():
     for t in ladder:
         print(f"  <= {t['price']:.2f}  -> {t['pct_of_balance']*100:.0f}%")
     print(f"Time cutoff: skip if < {cutoff_min:.0f} min remaining (~{cutoff_min/60:.1f}h)")
-    event_slug = cfg["event_slug"]
-    print(f"Event slug: {event_slug}")
+    # Match how bot.py discovers the event: keywords with fallback
+    keywords = cfg.get("event_slug_keywords") or []
+    fallback = cfg.get("event_slug_fallback") or cfg.get("event_slug") or ""
+    print(f"Keywords: {keywords}  fallback: {fallback}")
     print()
 
-    r = requests.get(f"{GAMMA}/events", params={"slug": event_slug}, timeout=15)
-    r.raise_for_status()
-    events = r.json()
-    if not events:
-        print("Event not found")
-        return 1
-    event = events[0]
+    import bot
+    event = bot.discover_event([k.lower() for k in keywords], fallback)
     markets = event.get("markets", [])
 
     open_markets = []
