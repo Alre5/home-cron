@@ -384,6 +384,34 @@ def cancel_order_safe(client: ClobClient, order_id: str) -> bool:
         return False
 
 
+# --- Polymarket v2 order signing (bypasses py-clob-client) ---
+#
+# As of mid-2026 Polymarket migrated to v2 of the CTF Exchange contracts.
+# py-clob-client 0.34.6 (and JS SDK 5.8.1) still build v1 orders, which the
+# v2 contracts reject with `order_version_mismatch` because the Order struct
+# has different fields:
+#   v1: salt, maker, signer, taker, tokenId, makerAmount, takerAmount,
+#       expiration, nonce, feeRateBps, side, signatureType
+#   v2: salt, maker, signer, tokenId, makerAmount, takerAmount, side,
+#       signatureType, timestamp, metadata, builder
+# We bypass the SDK and build/sign v2 orders manually below.
+#
+# Verified via Sourcify (chain 137):
+#   regular Exchange v2:  0xE111180000d2663C0091e4f400237545B87B996B
+#   NegRisk Exchange v2:  0xe2222d279d744050d28e00520010520000310F59
+# eip712Domain():  name="Polymarket CTF Exchange"  version="2"  chainId=137
+# ORDER_TYPEHASH = keccak("Order(uint256 salt,address maker,address signer,
+#   uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,
+#   uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)")
+EXCHANGE_V2_REGULAR = "0xE111180000d2663C0091e4f400237545B87B996B"
+EXCHANGE_V2_NEG_RISK = "0xe2222d279d744050d28e00520010520000310F59"
+DOMAIN_NAME_V2 = "Polymarket CTF Exchange"
+DOMAIN_VERSION_V2 = "2"
+ORDER_TYPEHASH_V2 = bytes.fromhex(
+    "bb86318a2138f5fa8ae32fbe8e659f8fcf13cc6ae4014a707893055433818589"
+)
+
+
 def post_gtc_limit_buy(
     client: ClobClient,
     token_id: str,
@@ -392,30 +420,108 @@ def post_gtc_limit_buy(
     tick_size: float = 0.01,
     neg_risk: bool = False,
 ) -> dict | None:
-    """Place a GTC limit BUY. Uses post_order(post_only=True) so the
-    exchange rejects the order if it would cross the spread — belt-and-
-    braces with our anti-cross check that runs before this call.
+    """Place a GTC limit BUY using Polymarket v2 order signing.
+
+    Builds the order struct, computes the EIP-712 digest, signs with the
+    user's EOA private key, and posts directly to /order with the L2 auth
+    headers from the SDK. post_only=True so the exchange rejects if our
+    bid would cross the spread (belt-and-braces with our anti-cross check).
     """
+    import secrets
+    import time as _time
+    import json as _json
+    from eth_abi import encode as _abi_encode
+    from eth_account import Account
+    from eth_utils import keccak as _keccak
+    from py_clob_client.clob_types import RequestArgs
+    from py_clob_client.endpoints import POST_ORDER
+    from py_clob_client.headers.headers import create_level_2_headers
+    from py_clob_client.signer import Signer
+
     try:
-        # Round price to the exchange tick size to avoid validation errors.
         ticks = round(price / tick_size)
         rounded_price = round(ticks * tick_size, 6)
-        from py_clob_client.clob_types import PartialCreateOrderOptions
-        opts = PartialCreateOrderOptions(
-            tick_size=str(tick_size).rstrip("0").rstrip(".") if tick_size != 0.01 else "0.01",
-            neg_risk=neg_risk,
+        # Quantize size to share decimals (2 by config; the exchange accepts up to 6).
+        size_shares = round(size_shares, 4)
+        maker_amt = int(round(size_shares * rounded_price * 1_000_000))
+        taker_amt = int(round(size_shares * 1_000_000))
+
+        funder = os.environ["POLYMARKET_FUNDER_ADDRESS"]
+        pk = os.environ["POLYMARKET_PRIVATE_KEY"]
+        sig_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1"))
+        eoa = Account.from_key(pk)
+
+        exchange = EXCHANGE_V2_NEG_RISK if neg_risk else EXCHANGE_V2_REGULAR
+        chain_id = POLYGON_CHAIN_ID
+
+        salt = secrets.randbits(64)
+        timestamp_ms = int(_time.time() * 1000)
+        metadata_b = b"\x00" * 32
+        builder_b = b"\x00" * 32
+
+        eip712_domain_typehash = _keccak(
+            b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
         )
-        args = OrderArgs(
-            token_id=token_id,
-            price=rounded_price,
-            size=size_shares,
-            side=BUY,
+        domain_sep = _keccak(_abi_encode(
+            ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+            [eip712_domain_typehash, _keccak(DOMAIN_NAME_V2.encode()),
+             _keccak(DOMAIN_VERSION_V2.encode()), chain_id, exchange],
+        ))
+        struct_hash = _keccak(_abi_encode(
+            ["bytes32", "uint256", "address", "address", "uint256",
+             "uint256", "uint256", "uint8", "uint8", "uint256",
+             "bytes32", "bytes32"],
+            [ORDER_TYPEHASH_V2, salt, funder, eoa.address, int(token_id),
+             maker_amt, taker_amt, 0, sig_type, timestamp_ms,
+             metadata_b, builder_b],
+        ))
+        digest = _keccak(b"\x19\x01" + domain_sep + struct_hash)
+        sig = Account._sign_hash(digest, private_key=pk)
+        signature_hex = sig.signature.hex()
+        if not signature_hex.startswith("0x"):
+            signature_hex = "0x" + signature_hex
+
+        body_order = {
+            "salt": salt,
+            "maker": funder,
+            "signer": eoa.address,
+            "tokenId": str(token_id),
+            "makerAmount": str(maker_amt),
+            "takerAmount": str(taker_amt),
+            "side": "BUY",
+            "signatureType": sig_type,
+            "timestamp": str(timestamp_ms),
+            "metadata": "0x" + metadata_b.hex(),
+            "builder": "0x" + builder_b.hex(),
+            "signature": signature_hex,
+        }
+        body = {
+            "deferExec": False,
+            "order": body_order,
+            "owner": client.creds.api_key,
+            "orderType": "GTC",
+            "postOnly": True,
+        }
+
+        serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        request_args = RequestArgs(
+            method="POST", request_path=POST_ORDER,
+            body=body, serialized_body=serialized,
         )
-        signed = client.create_order(args, opts)
-        resp = client.post_order(signed, OrderType.GTC, post_only=True)
-        return resp
+        signer_obj = Signer(private_key=pk, chain_id=chain_id)
+        headers = create_level_2_headers(signer_obj, client.creds, request_args)
+        r = requests.post(
+            f"{CLOB_API}/order", headers=headers, data=serialized, timeout=30,
+        )
+        if r.status_code != 200:
+            log.error(
+                "post v2 limit BUY %.2f x %.4f on %s HTTP %d: %s",
+                price, size_shares, token_id[:10], r.status_code, r.text[:300],
+            )
+            return None
+        return r.json()
     except Exception as e:
-        log.error("post limit BUY %.2f x %.4f on %s failed: %s", price, size_shares, token_id[:10], e)
+        log.exception("post v2 limit BUY %.2f x %.4f on %s failed: %s", price, size_shares, token_id[:10], e)
         return None
 
 
