@@ -32,7 +32,32 @@ def main() -> int:
                          "on the soonest market. Surfaces the real error from "
                          "post_order that the bot's try/except is swallowing. "
                          "If it succeeds, you'll see one new order in your account.")
+    ap.add_argument("--patch-exchange", default=None,
+                    help="Monkey-patch py-clob-client to use this exchange contract "
+                         "address instead of the SDK's hardcoded 0x4bFb41d5... "
+                         "Use the regular-exchange address from your allowance dict.")
+    ap.add_argument("--patch-neg-risk-exchange", default=None,
+                    help="Monkey-patch the NegRisk exchange address.")
     args = ap.parse_args()
+
+    # Patch must happen BEFORE building the client so the order builder uses
+    # the new addresses for EIP-712 domain.
+    if args.patch_exchange or args.patch_neg_risk_exchange:
+        from py_clob_client import config as clob_cfg
+        original = clob_cfg.get_contract_config
+
+        def patched_get_contract_config(chainID, neg_risk=False):
+            cfg = original(chainID, neg_risk)
+            if neg_risk and args.patch_neg_risk_exchange:
+                cfg.exchange = args.patch_neg_risk_exchange
+                print(f"  [patch] using neg_risk exchange={cfg.exchange}")
+            elif (not neg_risk) and args.patch_exchange:
+                cfg.exchange = args.patch_exchange
+                print(f"  [patch] using regular exchange={cfg.exchange}")
+            return cfg
+        clob_cfg.get_contract_config = patched_get_contract_config
+        # py_order_utils builder caches the address at build time so the
+        # patch only takes effect for orders built AFTER this point.
 
     load_dotenv()
     cfg = bot.load_config()
