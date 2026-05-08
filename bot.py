@@ -518,6 +518,11 @@ def post_gtc_limit_buy(
                 "post v2 limit BUY %.2f x %.4f on %s HTTP %d: %s",
                 price, size_shares, token_id[:10], r.status_code, r.text[:300],
             )
+            # Dump the body and resolved domain so we can see what differs
+            # between failing and succeeding markets.
+            log.error("  failed body.order: %s", _json.dumps(body_order))
+            log.error("  signed for exchange=%s neg_risk=%s sig_type=%d",
+                      exchange, neg_risk, sig_type)
             return None
         return r.json()
     except Exception as e:
