@@ -38,7 +38,24 @@ def main() -> int:
                          "Use the regular-exchange address from your allowance dict.")
     ap.add_argument("--patch-neg-risk-exchange", default=None,
                     help="Monkey-patch the NegRisk exchange address.")
+    ap.add_argument("--patch-domain-name", default=None,
+                    help="Override the EIP-712 domain name (default: 'Polymarket CTF Exchange').")
+    ap.add_argument("--patch-domain-version", default=None,
+                    help="Override the EIP-712 domain version (default: '1').")
     args = ap.parse_args()
+
+    # Patch EIP-712 domain name/version if requested
+    if args.patch_domain_name or args.patch_domain_version:
+        from py_order_utils.builders import base_builder as bb
+        from poly_eip712_structs import make_domain
+        original_get_domain = bb.BaseBuilder._get_domain_separator
+        new_name = args.patch_domain_name or "Polymarket CTF Exchange"
+        new_version = args.patch_domain_version or "1"
+        def patched_domain(self, chain_id, verifying_contract):
+            print(f"  [patch] EIP-712 domain: name={new_name!r} version={new_version!r} chain={chain_id} contract={verifying_contract}")
+            return make_domain(name=new_name, version=new_version, chainId=str(chain_id), verifyingContract=verifying_contract)
+        bb.BaseBuilder._get_domain_separator = patched_domain
+        print(f"  [patch] domain override installed: name={new_name!r} version={new_version!r}")
 
     # Patch must happen BEFORE building the client so the order builder uses
     # the new addresses for EIP-712 domain.
