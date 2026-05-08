@@ -566,6 +566,50 @@ def run_once_limit(cfg: Config, client: ClobClient, funder: str) -> None:
     open_orders = list_open_orders(client)
     log.info("Found %d open orders globally", len(open_orders))
 
+    # Build a token_id -> mins_left map across ALL event markets (not just
+    # tradeable ones) so we can decide whether existing open orders should
+    # be cancelled if their market has entered the danger zone.
+    token_to_mins_left: dict[str, float] = {}
+    token_to_question: dict[str, str] = {}
+    for m in raw_markets:
+        tid = yes_token_id(m)
+        if not tid:
+            continue
+        q = m.get("question") or m.get("slug") or ""
+        ml = minutes_until_resolution_day_end(q)
+        if ml is None:
+            continue
+        token_to_mins_left[tid] = ml
+        token_to_question[tid] = q
+
+    # Cancel any open BUY whose market is now within the time cutoff.
+    # Rationale: a resting bid at 0.70 sitting through the last 8h of EOD
+    # has asymmetric tail risk -- if Trump hasn't insulted by mid-evening,
+    # the ask can collapse from 0.85 to 0.50 and our bid fills at 0.70 on a
+    # market that is statistically very likely to resolve NO.
+    # We cancel ONLY orders on tokens we recognise from this event, leaving
+    # any unrelated orders alone.
+    cancelled_stale = 0
+    for o in list(open_orders):
+        if o.side != "BUY":
+            continue
+        ml = token_to_mins_left.get(o.token_id)
+        if ml is None:
+            continue
+        if ml < cfg.skip_if_minutes_remaining_below:
+            log.info(
+                "[%s] CANCEL stale order %s @ %.2f (%.4f sh, $%.2f) — only %.0f min left to EOD (< cutoff %.0f)",
+                token_to_question.get(o.token_id, o.token_id[:10]),
+                o.order_id[:14], o.price, o.size_remaining, o.remaining_usdc,
+                ml, cfg.skip_if_minutes_remaining_below,
+            )
+            if cancel_order_safe(client, o.order_id):
+                cancelled_stale += 1
+                open_orders.remove(o)
+    if cancelled_stale:
+        log.info("Cancelled %d stale orders (markets within %0.f min of EOD).",
+                 cancelled_stale, cfg.skip_if_minutes_remaining_below)
+
     # Build prioritized list of tradeable markets: filter by tradeable +
     # time-cutoff, sort by ascending mins-to-EOD, cap at max_active_markets.
     candidates = []
