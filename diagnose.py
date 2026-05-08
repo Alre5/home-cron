@@ -185,7 +185,7 @@ def post_v2_order_test():
     serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     request_args = RequestArgs(method="POST", request_path=POST_ORDER,
                                body=body, serialized_body=serialized)
-    signer = Signer(key=pk, chain_id=CHAIN_ID)
+    signer = Signer(private_key=pk, chain_id=CHAIN_ID)
     headers = create_level_2_headers(signer, creds, request_args)
 
     print(f"  POST body keys: {list(body.keys())}  order keys: {list(body_order.keys())}")
