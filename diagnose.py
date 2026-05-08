@@ -47,7 +47,15 @@ def main() -> int:
     ap.add_argument("--patch-defer-exec", action="store_true",
                     help="Inject deferExec=false at top level of POST /order body "
                          "(JS SDK 5.8.1 includes this; Python SDK does not).")
+    ap.add_argument("--v2-test", action="store_true",
+                    help="Manually build, sign and POST a v2 Polymarket order, "
+                         "bypassing the SDK's v1-only order builder. Uses the on-chain "
+                         "ORDER_TYPEHASH and v2 struct fields (timestamp/metadata/builder).")
     args = ap.parse_args()
+    if args.v2_test:
+        load_dotenv()
+        post_v2_order_test()
+        return 0
     if args.patch_defer_exec:
         from py_clob_client import utilities as utl
         original_order_to_json = utl.order_to_json
@@ -57,10 +65,137 @@ def main() -> int:
             print(f"  [patch] body now has deferExec=false; keys={list(body.keys())}")
             return body
         utl.order_to_json = patched
-        # client.py imports order_to_json at module level
         from py_clob_client import client as cli
         cli.order_to_json = patched
         print("  [patch] order_to_json wrapped to include deferExec=false")
+
+
+def post_v2_order_test():
+    """Manually build, sign and post a Polymarket v2 limit order, bypassing
+    the SDK's v1-only order builder. Uses the actual ORDER_TYPEHASH from the
+    deployed v2 contract, with the new fields (timestamp, metadata, builder)
+    instead of the v1 fields (taker, expiration, nonce, feeRateBps).
+    """
+    import secrets
+    import time
+    import requests
+    from eth_abi import encode as abi_encode
+    from eth_account import Account
+    from eth_utils import keccak
+
+    # Build minimal client just to get L2 headers + creds
+    client = bot.build_client()
+    creds = client.creds
+    funder = os.environ["POLYMARKET_FUNDER_ADDRESS"]
+    pk = os.environ["POLYMARKET_PRIVATE_KEY"]
+    eoa = Account.from_key(pk)
+
+    # Pick the same target market as before: May 8
+    event = bot.discover_event(["trump", "insult", "someone"], "will-trump-publicly-insult-someone-on-312")
+    target = None
+    for m in event.get("markets", []):
+        if "May 8, 2026" in (m.get("question") or ""):
+            target = m
+            break
+    if target is None:
+        print("FATAL: May 8 market not found")
+        return
+    yes_tid = bot.yes_token_id(target)
+    print(f"  target: {target.get('question')}")
+    print(f"  yes_token_id: {yes_tid[:20]}...")
+
+    # v2 contract constants (from on-chain eip712Domain() + Sourcify Hashing.sol)
+    EXCHANGE_V2 = "0xE111180000d2663C0091e4f400237545B87B996B"  # regular CTF Exchange v2
+    DOMAIN_NAME = "Polymarket CTF Exchange"
+    DOMAIN_VERSION = "2"
+    CHAIN_ID = 137
+    ORDER_TYPEHASH = bytes.fromhex(
+        "bb86318a2138f5fa8ae32fbe8e659f8fcf13cc6ae4014a707893055433818589"
+    )
+    EIP712_DOMAIN_TYPEHASH = keccak(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    )
+
+    # Order params (BUY 6.10 shares @ 0.70 = $4.27 like before)
+    price = 0.70
+    size_shares = 6.10
+    maker_amt = int(size_shares * price * 1_000_000)   # USDC 6 decimals
+    taker_amt = int(size_shares * 1_000_000)            # CTF 6 decimals
+    side = 0  # BUY
+    sig_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "1"))
+    salt = secrets.randbits(64)
+    timestamp_ms = int(time.time() * 1000)
+    metadata = b"\x00" * 32
+    builder = b"\x00" * 32
+
+    # Compute domain separator
+    domain_sep = keccak(abi_encode(
+        ["bytes32", "bytes32", "bytes32", "uint256", "address"],
+        [EIP712_DOMAIN_TYPEHASH, keccak(DOMAIN_NAME.encode()),
+         keccak(DOMAIN_VERSION.encode()), CHAIN_ID, EXCHANGE_V2],
+    ))
+
+    # Compute struct hash
+    struct_hash = keccak(abi_encode(
+        ["bytes32", "uint256", "address", "address", "uint256",
+         "uint256", "uint256", "uint8", "uint8", "uint256",
+         "bytes32", "bytes32"],
+        [ORDER_TYPEHASH, salt, funder, eoa.address, int(yes_tid),
+         maker_amt, taker_amt, side, sig_type, timestamp_ms,
+         metadata, builder],
+    ))
+
+    digest = keccak(b"\x19\x01" + domain_sep + struct_hash)
+    sig = Account._sign_hash(digest, private_key=pk)
+    signature_hex = "0x" + sig.signature.hex().lstrip("0x")
+    if not signature_hex.startswith("0x"):
+        signature_hex = "0x" + signature_hex
+    print(f"  v2 signature: {signature_hex[:34]}...{signature_hex[-8:]}")
+
+    body_order = {
+        "salt": salt,
+        "maker": funder,
+        "signer": eoa.address,
+        "tokenId": str(yes_tid),
+        "makerAmount": str(maker_amt),
+        "takerAmount": str(taker_amt),
+        "side": "BUY",
+        "signatureType": sig_type,
+        "timestamp": str(timestamp_ms),
+        "metadata": "0x" + metadata.hex(),
+        "builder": "0x" + builder.hex(),
+        "signature": signature_hex,
+    }
+    body = {
+        "deferExec": False,
+        "order": body_order,
+        "owner": creds.api_key,
+        "orderType": "GTC",
+        "postOnly": True,
+    }
+
+    # Build L2 headers via SDK
+    from py_clob_client.headers.headers import create_level_2_headers
+    from py_clob_client.http_helpers.helpers import POST
+    from py_clob_client.signer import Signer
+    from py_clob_client.endpoints import POST_ORDER
+    from py_clob_client.clob_types import RequestArgs
+    import json as _json
+
+    serialized = _json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+    request_args = RequestArgs(method="POST", request_path=POST_ORDER,
+                               body=body, serialized_body=serialized)
+    signer = Signer(key=pk, chain_id=CHAIN_ID)
+    headers = create_level_2_headers(signer, creds, request_args)
+
+    print(f"  POST body keys: {list(body.keys())}  order keys: {list(body_order.keys())}")
+    r = requests.post("https://clob.polymarket.com/order", headers=headers,
+                      data=serialized, timeout=30)
+    print(f"  HTTP {r.status_code}")
+    try:
+        print(f"  body: {r.json()}")
+    except Exception:
+        print(f"  text: {r.text[:500]}")
     if args.patch_sig_type is not None:
         os.environ["POLYMARKET_SIGNATURE_TYPE"] = str(args.patch_sig_type)
         print(f"  [patch] POLYMARKET_SIGNATURE_TYPE override: {args.patch_sig_type} "
