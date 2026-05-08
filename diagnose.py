@@ -55,15 +55,23 @@ def main() -> int:
         print(f"Raw balance/allowance response: {res}")
         if isinstance(res, dict):
             raw_bal = res.get("balance")
-            raw_allow = res.get("allowance")
             balance = int(raw_bal) / 1_000_000 if raw_bal else 0.0
-            allowance = int(raw_allow) / 1_000_000 if raw_allow else 0.0
-            print(f"USDC balance:   ${balance:.4f}")
-            print(f"USDC allowance: ${allowance:.4f}  <-- if 0.00 here, posting will fail")
+            print(f"USDC balance: ${balance:.4f}")
+            # The CLOB returns allowances per spender contract (Exchange,
+            # CTF, NegRisk). Polymarket sets each to max uint256 by default
+            # when you fund. Any 0 here means that contract can't pull USDC.
+            allowances = res.get("allowances") or {}
+            for spender, raw in allowances.items():
+                try:
+                    val = int(raw) / 1_000_000
+                except Exception:
+                    val = 0.0
+                # 1e29 = effectively infinite (max uint256 / 1e6)
+                tag = "OK (~max)" if val > 1e15 else f"${val:.2f}"
+                print(f"  allowance for {spender}: {tag}")
         else:
             balance = int(res) / 1_000_000
             print(f"USDC balance: ${balance:.4f}")
-            allowance = None
     except Exception as e:
         print(f"FATAL: balance/allowance fetch failed: {e}")
         traceback.print_exc()
