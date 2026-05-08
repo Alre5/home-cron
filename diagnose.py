@@ -42,7 +42,15 @@ def main() -> int:
                     help="Override the EIP-712 domain name (default: 'Polymarket CTF Exchange').")
     ap.add_argument("--patch-domain-version", default=None,
                     help="Override the EIP-712 domain version (default: '1').")
+    ap.add_argument("--patch-sig-type", type=int, default=None,
+                    help="Override POLYMARKET_SIGNATURE_TYPE for this run only. "
+                         "0=EOA, 1=POLY_PROXY (Magic Link), 2=POLY_GNOSIS_SAFE (newer wallets). "
+                         "Try 2 if you funded via Polymarket UI in 2024+.")
     args = ap.parse_args()
+    if args.patch_sig_type is not None:
+        os.environ["POLYMARKET_SIGNATURE_TYPE"] = str(args.patch_sig_type)
+        print(f"  [patch] POLYMARKET_SIGNATURE_TYPE override: {args.patch_sig_type} "
+              f"(0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE)")
 
     # Patch EIP-712 domain name/version if requested
     if args.patch_domain_name or args.patch_domain_version:
