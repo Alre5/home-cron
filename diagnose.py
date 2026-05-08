@@ -27,6 +27,10 @@ def main() -> int:
     ap.add_argument("--post-test", action="store_true",
                     help="Actually post one GTC limit BUY at 0.70 for ~$4.27 "
                          "via bot.post_gtc_limit_buy (v2 signing path).")
+    ap.add_argument("--cancel-all-event-orders", action="store_true",
+                    help="Cancel every open order for any sub-market in the "
+                         "configured event. Useful when migrating to a new "
+                         "ladder shape so the bot can reposition fresh.")
     args = ap.parse_args()
 
     load_dotenv()
@@ -87,6 +91,25 @@ def main() -> int:
     for o in open_orders:
         print(f"  side={o.side} price={o.price:.4f} size_remaining={o.size_remaining:.2f} "
               f"usdc=${o.remaining_usdc:.2f} token={o.token_id[:14]}... id={o.order_id[:14]}")
+
+    # Optional: cancel every open order whose token belongs to our event
+    if args.cancel_all_event_orders:
+        print("\n--- CANCEL ALL EVENT ORDERS ---")
+        event = bot.discover_event(cfg.event_slug_keywords, cfg.event_slug_fallback)
+        event_token_ids = set()
+        for m in (event.get("markets", []) or []):
+            tid = bot.yes_token_id(m)
+            if tid:
+                event_token_ids.add(tid)
+        cancelled = 0
+        for o in open_orders:
+            if o.token_id in event_token_ids:
+                ok = bot.cancel_order_safe(client, o.order_id)
+                print(f"  cancel {o.order_id[:14]} @ {o.price:.4f} ({o.size_remaining:.2f} sh): {'OK' if ok else 'FAILED'}")
+                if ok:
+                    cancelled += 1
+        print(f"Cancelled {cancelled}/{len(open_orders)} orders. Now run `python bot.py` to repopulate.")
+        return 0
 
     # Event + candidates
     print("\n--- EVENT DISCOVERY ---")

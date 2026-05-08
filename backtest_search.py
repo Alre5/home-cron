@@ -475,7 +475,7 @@ def main(argv=None):
 
     with open("config.yaml", "r", encoding="utf-8") as f:
         cfg_raw = yaml.safe_load(f)
-    event_slug = cfg_raw["event_slug"]
+    event_slug = cfg_raw.get("event_slug") or cfg_raw.get("event_slug_fallback") or "will-trump-publicly-insult-someone-on-312"
     bt = cfg_raw["backtest"]
     lookback_days = int(bt["lookback_days"])
     fidelity_minutes = int(bt["fidelity_minutes"])
@@ -742,15 +742,17 @@ def main(argv=None):
 
     # Ladders to stress-test
     survival_ladders = [
-        ("current_live (0.92/0.80/0.65/0.55, cum 100%)",
-         [(0.92, 0.10), (0.80, 0.20), (0.65, 0.30), (0.55, 0.40)]),
-        ("conservative_proposal (0.80/0.70/0.60/0.50, cum 50%)",
-         [(0.80, 0.05), (0.70, 0.10), (0.60, 0.15), (0.50, 0.20)]),
-        ("half_kelly_deep (0.70/0.60/0.55, cum 30%)",
-         [(0.70, 0.05), (0.60, 0.10), (0.55, 0.15)]),
-        ("deep_only_optimum (0.58/0.56/0.52, cum 120%)",
-         [(0.58, 0.40), (0.56, 0.40), (0.52, 0.40)]),
-        ("ultra_safe (0.65/0.55, cum 20%)",
+        ("CURRENT live (0.70/0.60/0.55 @ 8/10/15, cum 33%)",
+         [(0.70, 0.08), (0.60, 0.10), (0.55, 0.15)]),
+        ("Option C (0.85/0.70/0.55 @ 8/8/10, cum 26%)",
+         [(0.85, 0.08), (0.70, 0.08), (0.55, 0.10)]),
+        ("Option C-lite (0.85/0.70/0.55 @ 5/8/10, cum 23%)",
+         [(0.85, 0.05), (0.70, 0.08), (0.55, 0.10)]),
+        ("Option C-bigtop (0.85/0.70/0.55 @ 12/8/10, cum 30%)",
+         [(0.85, 0.12), (0.70, 0.08), (0.55, 0.10)]),
+        ("only-085 (0.85 @ 8%) — isolates the new top tier risk",
+         [(0.85, 0.08)]),
+        ("ultra_safe baseline (0.65/0.55, cum 20%)",
          [(0.65, 0.05), (0.55, 0.15)]),
     ]
 

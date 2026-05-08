@@ -33,22 +33,24 @@ order_mode: limit
 #   if market dips gradually each fills at its own price
 #   if market crashes past 0.55 all three fill at the lower ask
 entry_ladder:
+  - price: 0.85
+    pct_of_balance: 0.09    # tier 1: fires on routine quotes (current asks 0.83-0.99).
+                            # 9% chosen so size>=5sh at 0.85 with $50 balance (clears
+                            # the exchange minimum_order_size). +5-10% EV/share at YES
+                            # rate >=90% (observed 15/16 = 93.75%). Break-even rate=85%.
   - price: 0.70
-    pct_of_balance: 0.08    # tier 1: catches fresh-listed far-future markets
-  - price: 0.60
-    pct_of_balance: 0.10    # tier 2: cum 18%
+    pct_of_balance: 0.08    # tier 2: catches moderate dips (cum 17%)
   - price: 0.55
-    pct_of_balance: 0.15    # tier 3: cum 33% max per market
-  # Sized to clear Polymarket's per-market minimum order size (5 shares):
-  # at $50 balance, tier 1 = $4 = 5.7 shares at 0.70 -> posts. Smaller %
-  # would silently fail. Cumulative 33% is one percentage-point above the
-  # survival-analysis-validated 30% ladder; ruin probability stays <1% at
-  # observed YES rates >= 80%, ~9% at a pessimistic 70%.
-  # Trade-off: this ladder will NOT fire on a market currently asking 0.85+.
-  # That is intentional. The bot waits for newly-listed far-future markets
-  # (which historically launch around 0.50-0.70) and for genuine dips.
-  # Combined with the 8h time-cutoff, this avoids the worst tail risk:
-  # paying near-1.00 for a market that resolves NO in the last hours.
+    pct_of_balance: 0.10    # tier 3: catches deep dips, cum 27% max per market
+  # Selected by survival-analysis Monte Carlo (5000 trajectories x 365 sim-days).
+  # P(ruin: wealth<20% start) is 0.00% at YES rate >=80%, 0.78% at 75%, 2.80% at 70%.
+  # That is STRICTLY better than the previous 0.70/0.60/0.55 cum-33% ladder
+  # (which was 0.50% / 2.66% / 8.46% in the same scenarios) -- lower cumulative
+  # per-market exposure dominates the slightly higher fragility of the 0.85
+  # tier in isolation.
+  # The tier at 0.85 is the working tier: with current asks at 0.85-0.99 it
+  # has a realistic chance of filling (whereas 0.70 has been parked unfilled
+  # for the last 8 days). Deeper tiers protect us from panic-dive scenarios.
 
 # Polymarket enforces ~$1 minimum order value. Skip any top-up below this.
 min_order_usdc: 1.0
@@ -75,7 +77,9 @@ skip_if_minutes_remaining_below: 480
 # Total fraction of balance the bot will commit (open orders + filled
 # positions, summed across all markets). When at or above the cap, no new
 # orders are placed. Existing orders are not auto-cancelled.
-max_total_exposure_pct: 0.50
+# 0.65 lets us cover 8 markets at tier 1 (8 x 9% = 72%, but tier 1 doesn't
+# all fire simultaneously -- it caps at first 7 placements ~63% balance).
+max_total_exposure_pct: 0.65
 
 # Cap on how many distinct markets the bot will hold open orders / positions
 # in simultaneously. With ~30 daily markets and a small balance, spreading
