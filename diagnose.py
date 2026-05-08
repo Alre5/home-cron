@@ -3,15 +3,22 @@ state (balance, open orders, positions), and show exactly why each
 candidate tier would or wouldn't get an order.
 
 Run locally:  python diagnose.py
+              python diagnose.py --post-test     # actually posts ONE small
+                                                 # GTC limit BUY at 0.70 to
+                                                 # see the real error from
+                                                 # the exchange (or success)
+
 Requires `.env` to be present with the same secrets as GH Actions.
 
-This calls NOTHING destructive: no order create, no order cancel.
+Without --post-test, calls nothing destructive.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
+import traceback
 
 from dotenv import load_dotenv
 
@@ -19,6 +26,14 @@ import bot
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--post-test", action="store_true",
+                    help="Attempt to post ONE GTC limit BUY at 0.70 for ~$4 worth "
+                         "on the soonest market. Surfaces the real error from "
+                         "post_order that the bot's try/except is swallowing. "
+                         "If it succeeds, you'll see one new order in your account.")
+    args = ap.parse_args()
+
     load_dotenv()
     cfg = bot.load_config()
     print(f"== Diagnose for order_mode={cfg.order_mode!r} ==\n")
@@ -32,12 +47,26 @@ def main() -> int:
     funder = os.environ.get("POLYMARKET_FUNDER_ADDRESS")
     print(f"Funder: {funder}")
 
-    # Balance
+    # Balance + allowance
     try:
-        balance = bot.get_balance_usdc(client)
-        print(f"USDC balance: ${balance:.4f}")
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        res = client.get_balance_allowance(params)
+        print(f"Raw balance/allowance response: {res}")
+        if isinstance(res, dict):
+            raw_bal = res.get("balance")
+            raw_allow = res.get("allowance")
+            balance = int(raw_bal) / 1_000_000 if raw_bal else 0.0
+            allowance = int(raw_allow) / 1_000_000 if raw_allow else 0.0
+            print(f"USDC balance:   ${balance:.4f}")
+            print(f"USDC allowance: ${allowance:.4f}  <-- if 0.00 here, posting will fail")
+        else:
+            balance = int(res) / 1_000_000
+            print(f"USDC balance: ${balance:.4f}")
+            allowance = None
     except Exception as e:
-        print(f"FATAL: balance fetch failed: {e}")
+        print(f"FATAL: balance/allowance fetch failed: {e}")
+        traceback.print_exc()
         return 1
 
     if balance < cfg.min_order_usdc:
@@ -120,18 +149,49 @@ def main() -> int:
         try:
             from py_clob_client.clob_types import PartialCreateOrderOptions, OrderArgs
             from py_clob_client.order_builder.constants import BUY
-            ts = c["token_id"] if "token_id" in c else None
-            args = OrderArgs(
+            ts = c["token_id"]
+            test_args = OrderArgs(
                 token_id=ts,
                 price=0.70,
                 size=10.0,
                 side=BUY,
             )
             opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
-            signed = client.create_order(args, opts)
+            signed = client.create_order(test_args, opts)
             print(f"  create_order OK on {c['question'][:50]}... signed_keys={list(vars(signed).keys()) if hasattr(signed,'__dict__') else type(signed).__name__}")
         except Exception as e:
             print(f"  create_order FAILED: {type(e).__name__}: {e}")
+            traceback.print_exc()
+
+    # --- DESTRUCTIVE: post a real order to surface the actual exchange error ---
+    if args.post_test and active:
+        c = active[0]
+        print(f"\n--- POST-TEST: actually posting one GTC limit BUY ---")
+        print(f"  market: {c['question']}")
+        print(f"  size: 6.10 shares @ 0.70 = $4.27 (well above $5 min and within balance)")
+        try:
+            from py_clob_client.clob_types import PartialCreateOrderOptions, OrderArgs, OrderType
+            from py_clob_client.order_builder.constants import BUY
+            real_args = OrderArgs(
+                token_id=c["token_id"],
+                price=0.70,
+                size=6.10,
+                side=BUY,
+            )
+            opts = PartialCreateOrderOptions(tick_size="0.01", neg_risk=False)
+            signed = client.create_order(real_args, opts)
+            print("  create_order: OK")
+            print("  calling post_order(GTC, post_only=True)...")
+            resp = client.post_order(signed, OrderType.GTC, post_only=True)
+            print(f"  post_order RESPONSE: {resp}")
+            print()
+            print("  -> If you see {'success': True} or an order ID above, the bot's")
+            print("     issue is something else (e.g., post_only rejection in some cases).")
+            print("  -> If you see an error message, that IS what the bot's try/except")
+            print("     was swallowing. We now know what to fix.")
+        except Exception as e:
+            print(f"  post_order RAISED: {type(e).__name__}: {e}")
+            traceback.print_exc()
 
     return 0
 
