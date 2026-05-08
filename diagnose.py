@@ -42,8 +42,13 @@ def main() -> int:
 
     # Patch must happen BEFORE building the client so the order builder uses
     # the new addresses for EIP-712 domain.
+    # Both py_clob_client.client and py_clob_client.order_builder.builder do
+    # `from .config import get_contract_config` -- so we have to rebind the
+    # name in EACH consumer module, not just the source module.
     if args.patch_exchange or args.patch_neg_risk_exchange:
         from py_clob_client import config as clob_cfg
+        from py_clob_client import client as clob_client_mod
+        from py_clob_client.order_builder import builder as clob_builder_mod
         original = clob_cfg.get_contract_config
 
         def patched_get_contract_config(chainID, neg_risk=False):
@@ -56,8 +61,9 @@ def main() -> int:
                 print(f"  [patch] using regular exchange={cfg.exchange}")
             return cfg
         clob_cfg.get_contract_config = patched_get_contract_config
-        # py_order_utils builder caches the address at build time so the
-        # patch only takes effect for orders built AFTER this point.
+        clob_client_mod.get_contract_config = patched_get_contract_config
+        clob_builder_mod.get_contract_config = patched_get_contract_config
+        print(f"  [patch] installed get_contract_config override on 3 modules")
 
     load_dotenv()
     cfg = bot.load_config()
