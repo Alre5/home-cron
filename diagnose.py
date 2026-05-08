@@ -43,10 +43,24 @@ def main() -> int:
     ap.add_argument("--patch-domain-version", default=None,
                     help="Override the EIP-712 domain version (default: '1').")
     ap.add_argument("--patch-sig-type", type=int, default=None,
-                    help="Override POLYMARKET_SIGNATURE_TYPE for this run only. "
-                         "0=EOA, 1=POLY_PROXY (Magic Link), 2=POLY_GNOSIS_SAFE (newer wallets). "
-                         "Try 2 if you funded via Polymarket UI in 2024+.")
+                    help="Override POLYMARKET_SIGNATURE_TYPE for this run only.")
+    ap.add_argument("--patch-defer-exec", action="store_true",
+                    help="Inject deferExec=false at top level of POST /order body "
+                         "(JS SDK 5.8.1 includes this; Python SDK does not).")
     args = ap.parse_args()
+    if args.patch_defer_exec:
+        from py_clob_client import utilities as utl
+        original_order_to_json = utl.order_to_json
+        def patched(order, owner, orderType, post_only=False):
+            body = original_order_to_json(order, owner, orderType, post_only)
+            body["deferExec"] = False
+            print(f"  [patch] body now has deferExec=false; keys={list(body.keys())}")
+            return body
+        utl.order_to_json = patched
+        # client.py imports order_to_json at module level
+        from py_clob_client import client as cli
+        cli.order_to_json = patched
+        print("  [patch] order_to_json wrapped to include deferExec=false")
     if args.patch_sig_type is not None:
         os.environ["POLYMARKET_SIGNATURE_TYPE"] = str(args.patch_sig_type)
         print(f"  [patch] POLYMARKET_SIGNATURE_TYPE override: {args.patch_sig_type} "
@@ -93,6 +107,20 @@ def main() -> int:
     load_dotenv()
     cfg = bot.load_config()
     print(f"== Diagnose for order_mode={cfg.order_mode!r} ==\n")
+
+    # Derive EOA from private key and compare with expected funder/proxy
+    try:
+        from eth_account import Account
+        pk = os.environ.get("POLYMARKET_PRIVATE_KEY", "")
+        acct = Account.from_key(pk)
+        print(f"EOA from PRIVATE_KEY: {acct.address}")
+        print(f"FUNDER (proxy)      : {os.environ.get('POLYMARKET_FUNDER_ADDRESS')}")
+        print(f"SIG_TYPE            : {os.environ.get('POLYMARKET_SIGNATURE_TYPE', '1')}")
+        print(f"  (For POLY_PROXY wallets the EOA is the *admin* of the proxy.")
+        print(f"   These two addresses are DIFFERENT by design -- that's normal.")
+        print(f"   What matters is that this EOA is the registered owner of the proxy.)")
+    except Exception as e:
+        print(f"Could not derive EOA: {e}")
 
     # Build the real client — same path bot.py takes
     try:
